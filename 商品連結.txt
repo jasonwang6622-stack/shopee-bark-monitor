@@ -1,0 +1,11 @@
+使用者提供的原始分享連結：
+https://s.shopee.tw/8Kqe14Qu9q
+
+已解析的商品資料：
+賣家 ID：1510747083
+商品 ID：53668488583
+
+監控程式使用的完整連結：
+https://shopee.tw/product/1510747083/53668488583
+
+注意：已取得商品 ID，但本環境無法成功讀取蝦皮商品頁；請在自己的 MacBook 上使用 python3 monitor.py --diagnose 驗證庫存資料。

@@ -1,0 +1,12 @@
+{
+  "bark_key": "在這裡貼上 Bark App 裡的推播 Key",
+  "bark_server": "https://api.day.app",
+  "interval_seconds": 600,
+  "items": [
+    {
+      "name": "我的第一個商品",
+      "url": "https://shopee.tw/商品名稱-i.123456789.987654321",
+      "variant_keywords": []
+    }
+  ]
+}

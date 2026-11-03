@@ -1,0 +1,12 @@
+{
+  "bark_key": "在這裡貼上 Bark App 裡的推播 Key",
+  "bark_server": "https://api.day.app",
+  "interval_seconds": 600,
+  "items": [
+    {
+      "name": "蝦皮商品 53668488583",
+      "url": "https://shopee.tw/product/1510747083/53668488583",
+      "variant_keywords": []
+    }
+  ]
+}
