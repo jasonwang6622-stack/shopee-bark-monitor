@@ -131,32 +131,99 @@ def detect_interstitial(html: str) -> bool:
     return any(term in body for term in terms)
 
 
-def browser_payload(url: str, shop_id: str, item_id: str) -> Optional[dict]:
-    """Optional Playwright fallback: read rendered HTML only; no bypass."""
+def inspect_browser_controls(snapshot: dict) -> Result:
+    """Conservative DOM fallback. Never treat missing controls as a stock-out.
+
+    Real-world Shopee markup may differ; a positive result still needs live
+    validation against this particular product before relying on alerts.
+    """
+    title = str(snapshot.get("product_title") or "").strip()
+    if snapshot.get("blocked"):
+        return Result("unknown", "瀏覽器被要求登入／進行驗證；不繞過限制")
+    if not title or title.casefold() in {"shopee", "蝦皮購物", "shopee taiwan"}:
+        return Result("unknown", "網頁未呈現可確認的商品標題")
+
+    controls = snapshot.get("controls") or []
+    purchase_terms = ("加入購物車", "加到購物車", "直接購買", "立即購買", "add to cart", "buy now")
+    sold_terms = ("已售完", "已售罄", "售完", "缺貨", "補貨中", "sold out", "out of stock")
+    purchase = []
+    sold_out = []
+    for control in controls:
+        if not isinstance(control, dict) or not control.get("visible"):
+            continue
+        text = str(control.get("text", "")).strip().casefold()
+        if len(text) > 40:  # Ignore huge containers that wrap unrelated products.
+            continue
+        if any(t in text for t in sold_terms):
+            sold_out.append(control)
+        if any(t in text for t in purchase_terms):
+            purchase.append(control)
+
+    if sold_out and not any(c.get("disabled") is False for c in purchase):
+        return Result("out_of_stock", "商品購買操作顯示已售完／缺貨", title)
+    if purchase and any(c.get("disabled") is False for c in purchase) and not sold_out:
+        return Result("in_stock", "商品購買操作可使用（DOM 備援）", title)
+    if purchase and all(c.get("disabled") is True for c in purchase):
+        return Result("unknown", "購買按鈕不可使用，但沒有明確缺貨文字，無法確定是缺貨或登入／配送限制", title)
+    return Result("unknown", "網頁已載入，但沒有可確認的購買按鈕狀態", title)
+
+
+def browser_inspect(url: str, shop_id: str, item_id: str) -> Result:
+    """Only inspect the rendered page. No login, clicking, or CAPTCHA bypass."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        logging.debug("Playwright 未安裝，略過瀏覽器備援")
-        return None
+        return Result("unknown", "尚未安裝 Playwright，無法使用瀏覽器備援")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             try:
                 page = browser.new_page(locale="zh-TW")
-                page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                page.wait_for_timeout(2200)
+                response = page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                page.wait_for_timeout(3500)
                 html = page.content()
+                if detect_interstitial(html):
+                    return Result("unknown", "瀏覽器遇到驗證／登入要求")
                 payload = extract_payload(html, shop_id, item_id)
                 if payload is not None:
-                    return payload
-                if detect_interstitial(html):
-                    logging.warning("瀏覽器顯示驗證／登入頁面，沒有可讀庫存")
-                return None
+                    parsed = inspect_payload(payload, [])
+                    if parsed.state != "unknown":
+                        return parsed
+                    logging.info("嵌入式商品資料仍無法判定：%s；改檢查可見購買按鈕", parsed.reason)
+                snapshot = page.evaluate("""() => {
+                    const visible = el => {
+                        const rect = el.getBoundingClientRect();
+                        const style = getComputedStyle(el);
+                        return rect.width > 0 && rect.height > 0 && rect.top > -200 && rect.top < innerHeight * 1.5 && style.visibility !== 'hidden' && style.display !== 'none';
+                    };
+                    const controls = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'))
+                        .filter(visible)
+                        .map(el => ({
+                            text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ').slice(0, 90),
+                            disabled: Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true' || el.closest('[aria-disabled="true"]')),
+                            visible: true
+                        }))
+                        .filter(b => /加入購物車|加到購物車|直接購買|立即購買|已售完|已售罄|售完|缺貨|補貨中|add to cart|buy now|sold out|out of stock/i.test(b.text))
+                        .slice(0, 15);
+                    const meta = document.querySelector('meta[property="og:title"]')?.content || '';
+                    const heading = document.querySelector('h1')?.innerText || '';
+                    return {
+                        product_title: (meta || heading).trim().slice(0, 140),
+                        page_title: document.title.slice(0, 140),
+                        controls,
+                        blocked: /captcha|verify you are human|請下載並登入蝦皮購物\\s*app|請登入蝦皮購物app/i.test((document.body?.innerText || '').slice(0, 5000))
+                    };
+                }""")
+                # Public, short diagnostics only; don't print arbitrary page content.
+                logging.info("瀏覽器診斷：標題=%r，相關購買按鈕=%s，HTTP=%s",
+                             snapshot.get('product_title', '')[:65],
+                             snapshot.get('controls', [])[:6],
+                             getattr(response, 'status', '?'))
+                return inspect_browser_controls(snapshot)
             finally:
                 browser.close()
     except Exception as exc:
-        logging.warning("瀏覽器備援失敗：%s", str(exc)[:160])
-        return None
+        return Result("unknown", "瀏覽器讀取失敗：" + str(exc)[:140])
 
 
 def fetch_stock(session: requests.Session, item: dict, use_browser: bool) -> Result:
@@ -165,25 +232,30 @@ def fetch_stock(session: requests.Session, item: dict, use_browser: bool) -> Res
         shop_id, item_id = parse_product_ids(url)
     except ValueError as exc:
         return Result("unknown", str(exc))
+
+    payload = None
     try:
         resp = session.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
         if resp.status_code in (403, 429):
             return Result("unknown", f"網站拒絕請求（HTTP {resp.status_code}），不嘗試繞過限制")
         resp.raise_for_status()
-        payload = extract_payload(resp.text, shop_id, item_id)
-        if payload is None and detect_interstitial(resp.text):
+        if detect_interstitial(resp.text):
             return Result("unknown", "蝦皮要求驗證或登入，無法判斷")
+        payload = extract_payload(resp.text, shop_id, item_id)
     except requests.RequestException as exc:
         return Result("unknown", "網路或網站錯誤：" + str(exc)[:160])
 
-    if payload is None and use_browser:
-        payload = browser_payload(url, shop_id, item_id)
-    if payload is None:
-        return Result("unknown", "頁面找不到商品庫存結構（蝦皮可能修改頁面或限制存取）")
     keywords = item.get("variant_keywords", [])
     if not isinstance(keywords, list):
         return Result("unknown", "variant_keywords 必須是文字陣列")
-    return inspect_payload(payload, keywords)
+    parsed = inspect_payload(payload, keywords) if payload is not None else None
+    if parsed is not None and parsed.state != "unknown":
+        return parsed
+    if use_browser:
+        if keywords:
+            return parsed or Result("unknown", "指定規格需要結構化資料；DOM 備援無法安全確認指定規格")
+        return browser_inspect(url, shop_id, item_id)
+    return parsed or Result("unknown", "頁面找不到可辨識的庫存結構")
 
 
 def send_bark(config: dict, title: str, body: str, url: str = "") -> None:
@@ -221,18 +293,44 @@ def validate_config(config: dict) -> None:
         parse_product_ids(str(item["url"]))
 
 
-def check_all(config: dict, session: requests.Session, *, use_browser: bool, dry_run: bool = False) -> None:
+def check_all(config: dict, session: requests.Session, *, use_browser: bool, dry_run: bool = False) -> int:
+    """Return number of unknown stock checks, preserving confirmed stock states."""
     state = load_json(STATE_FILE, {}) if not dry_run else {}
     changed = False
+    unknown_count = 0
     for item in config["items"]:
         url = str(item["url"])
         words = item.get("variant_keywords", [])
         key = url.split("?")[0] + "::" + json.dumps(words, ensure_ascii=False)
+        health_key = "__health__::" + key
         label = str(item.get("name") or "蝦皮商品")
         result = fetch_stock(session, item, use_browser)
         logging.info("%s | %s | %s", label, result.state, result.reason)
-        if dry_run or result.state == "unknown":
+        if dry_run:
+            if result.state == "unknown":
+                unknown_count += 1
             continue
+        if result.state == "unknown":
+            unknown_count += 1
+            health = state.get(health_key, {})
+            if not isinstance(health, dict):
+                health = {}
+            count = int(health.get("failures", 0)) + 1
+            alerted = bool(health.get("alerted", False))
+            threshold = max(1, int(config.get("unknown_alert_after", 3)))
+            if count >= threshold and not alerted:
+                try:
+                    send_bark(config, "⚠️ 蝦皮庫存監控異常", f"{label} 已連續 {count} 次無法讀取庫存；補貨通知暫時不可靠。\n{result.reason}", url)
+                    alerted = True
+                    logging.warning("已透過 Bark 提醒庫存辨識異常")
+                except Exception as exc:
+                    logging.error("異常推播失敗，下次會重試：%s", str(exc)[:160])
+            state[health_key] = {"failures": count, "alerted": alerted}
+            changed = True
+            continue
+        if health_key in state:
+            del state[health_key]
+            changed = True
         previous = state.get(key)
         if previous == "out_of_stock" and result.state == "in_stock":
             message = f"{result.title or label}\n{result.reason}\n點擊查看商品"
@@ -240,15 +338,16 @@ def check_all(config: dict, session: requests.Session, *, use_browser: bool, dry
                 send_bark(config, "🛒 蝦皮商品補貨了！", message, url)
                 logging.info("✅ 補貨推播成功：%s", label)
             except Exception as exc:
-                # Do not mark as available until notification succeeds: retry next time.
                 logging.error("補貨通知失敗，保留缺貨狀態以便下次重試：%s", str(exc)[:200])
                 continue
         elif previous is None:
             logging.info("首次檢查建立基準狀態（不發補貨通知）：%s", label)
-        state[key] = result.state
-        changed = True
-    if changed and not dry_run:
+        if previous != result.state:
+            state[key] = result.state
+            changed = True
+    if changed:
         save_json(STATE_FILE, state)
+    return unknown_count
 
 
 def main() -> int:
