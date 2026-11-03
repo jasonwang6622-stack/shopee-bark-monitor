@@ -71,7 +71,7 @@ jobs:
           esac
 
       - name: Save stock state
-        if: ${{ success() && (github.event_name == 'schedule' || github.event.inputs.mode == 'check') }}
+        if: ${{ always() && (github.event_name == 'schedule' || github.event.inputs.mode == 'check') }}
         shell: bash
         run: |
           if [[ ! -f state.json ]]; then
