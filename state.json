@@ -1,6 +1,6 @@
 {
   "__health__::https://shopee.tw/product/1510747083/53668488583::[]": {
-    "failures": 2,
-    "alerted": false
+    "failures": 3,
+    "alerted": true
   }
 }
